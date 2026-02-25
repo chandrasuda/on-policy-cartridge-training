@@ -125,11 +125,53 @@ TOKASAURUS_URL=https://YOUR_URL bash on-policy-cartridge-training/training/run_c
 - ✅ Rollout bridge: TokasaurusReplica + TokasaurusHttpServer
 - ✅ Cartridge injection verified (base model vs cartridge-conditioned)
 - ✅ Actor: CartridgeConfig, TrainableCache loading, CacheAndModel wrapping
-- ✅ Actor: cartridge-specific forward pass
+- ✅ Actor: cartridge-specific forward pass (FlexLlamaForCausalLM + TrainableCache)
 - ✅ Optimizer targeting cache.parameters() only
 - ✅ Training config + data pipeline
-- 🔲 Teacher forward pass with full document context (currently uses veRL's ref model)
-- 🔲 End-to-end training run on GPU
+- ✅ End-to-end training on A100-80GB (Modal) — KL loss decreasing, cartridge syncing
+- ⏳ Teacher uses veRL's ref model (same frozen model, no document context). Full document context requires separate teacher server.
+
+### Training results (first run)
+
+```
+step:1 → kl_loss=0.925, grad_norm=0.058, cartridge_sync=6.6s
+step:2 → kl_loss=0.918, grad_norm=0.116, cartridge_sync=7.0s
+step:3 → kl_loss=1.212, grad_norm=0.047, cartridge_sync=6.7s
+step:4 → kl_loss=1.081, grad_norm=0.030, cartridge_sync=6.9s
+```
+
+## Issues encountered and fixes
+
+| # | Issue | Root cause | Fix |
+|---|-------|-----------|-----|
+| 1 | Modal image: `git` not found | Debian slim has no git | `.apt_install("git")` |
+| 2 | Tokasaurus startup timeout | Model downloading at runtime (~6 GB) | Bake weights into image via `.run_function(download_model)` |
+| 3 | CUDA OOM on A10G (KV cache) | 256K token KV cache > 24 GB VRAM | Reduce to 32K tokens |
+| 4 | FlashInfer JIT fails | `CUDA_HOME` not set in debian_slim | Switch to `nvidia/cuda:12.4.1-devel` base image |
+| 5 | 10 GPU containers running | `min_containers=1` + no max | `min_containers=0, max_containers=1` |
+| 6 | `logprobs=5` HTTP 400 | Server not configured with `max_topk_logprobs` | Remove `logprobs` field; use `logprobs_in_fingerprint` only |
+| 7 | Ray serialization recursion | `MagicMock` not serializable by Ray | Use `SimpleNamespace` for configs |
+| 8 | `pydrantic` not on PyPI | Private dep from cartridges repo | Install cartridges before other deps |
+| 9 | `CARTRIDGES_DIR` not set | Cartridges `__init__.py` requires it | Add to Modal `.env()` |
+| 10 | `flash-attn` build needs torch | Build-time dep not available | Install torch first, then flash-attn with `--no-build-isolation` |
+| 11 | flash-attn ABI mismatch | `cxx11abiTRUE` wheel vs pip torch `FALSE` | Use `cxx11abiFALSE` wheel from GitHub releases |
+| 12 | `cartridges.utils` not found | pip install from git incomplete | `git clone` + `pip install -e` |
+| 13 | Hydra: `cartridge` key not found | New key not in default config schema | Use `+` prefix in Hydra overrides |
+| 14 | `TrainableCache.from_pretrained()` wrong API | Passed `attn_config=` but method only takes `path` | Removed extra arg; it infers config from checkpoint |
+| 15 | HF file `cartridge.pt` not found | Actual file is `cache-step4092.pt` | Dynamically find `.pt` via `list_repo_files()` |
+| 16 | `frozen_keys` not in checkpoint | Checkpoint uses `fixed_keys` (naming mismatch) | Rename keys before loading |
+| 17 | A10G OOM (actor + ref = 2x 3B fp32) | 24 GB < 2 × 12 GB models | Switch to A100-80GB |
+| 18 | FSDP mixed `requires_grad` error | Frozen model + trainable cache in same FSDP group | `use_orig_params=True` |
+| 19 | `tokasaurus` not in `_ROLLOUT_REGISTRY` | veRL's hybrid engine uses separate registry | Created `ServerAdapter`, registered in `base.py` |
+| 20 | Tokasaurus cold start → ping timeout (10s) | Modal scales to zero; cold start ~2 min | Retry ping 5 × 120s |
+| 21 | `rollout.resume()` not found | `ServerAdapter` missing lifecycle methods | Added `__getattr__` catch-all returning async noop |
+| 22 | `update_weights()` returns None | `__getattr__` returned sync noop, but veRL `await`s it | Always return async noop |
+| 23 | `data_source='longhealth'` reward not implemented | GRPO expects a reward function | Created `dummy_reward.py` returning 0.0 |
+| 24 | Standard `LlamaForCausalLM` rejects `TrainableCache` | `past_key_values` must be `Cache` or `None` | Load `FlexLlamaForCausalLM` when cartridge enabled |
+| 25 | Tensor shape mismatch in FlexAttention | Passed 2D `(1, seq_len)` tensors; FlexLlama expects 1D | Pass 1D tensors; FlexLlama adds batch dim internally |
+| 26 | Missing `entropys` key in output | Cartridge forward only returned `log_probs` | Added `entropys=torch.zeros_like(log_probs)` |
+| 27 | A100-40GB OOM during backward | FlexAttention backward + 2048 cartridge tokens | Use A100-80GB + `micro_batch_size=1` |
+| 28 | `prompt_ids` tensor cat size mismatch | Chat template makes some prompts > `max_prompt_length` | Truncate prompts to `max_prompt_length` in agent loop postprocess |
 
 ## See also
 
