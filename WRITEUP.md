@@ -281,7 +281,7 @@ Compare to offline:
 
 ### Current limitations
 
-1. **Teacher doesn't have full document context.** The ref model (teacher) is the same frozen Llama without any context — it just sees the prompt + student's response. The original paper's teacher sees the full 50K-token documents. To fix: either (a) send the student's response to Tokasaurus without cartridge but with full documents in the prompt, or (b) stuff documents into the ref model's input.
+1. **~~Teacher doesn't have full document context.~~** FIXED. The teacher now calls Tokasaurus directly with `[document_tokens + prompt + response]` and no cartridge (`_compute_teacher_logprobs_via_tokasaurus` in `ray_trainer.py`). Each sample's `document_text` is tokenized and prepended to the full input, then sent to Tokasaurus for teacher logprobs. This completely bypasses veRL's ref model — the teacher runs on the inference server with full 12K-token patient documents in context, matching the original paper's setup.
 
 2. **GRPO wrapper.** We're using veRL's GRPO algorithm as a wrapper with a dummy reward function. The actual training signal is the KL loss between actor and ref (`use_kl_loss=True`). A dedicated cartridge distillation trainer would be cleaner.
 
