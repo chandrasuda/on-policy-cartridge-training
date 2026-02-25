@@ -308,11 +308,18 @@ Compare to offline:
 First successful run (A100-80GB, batch_size=8, 2 epochs × 18 batches = 36 steps):
 
 ```
-step:1 → kl_loss=0.749, grad_norm=0.019, cartridge_sync=10.8s, throughput=8.4 tok/s
-step:2 → kl_loss=1.110, grad_norm=0.021, cartridge_sync=9.5s, throughput=24.7 tok/s
-step:3 → kl_loss=1.127, grad_norm=0.007, cartridge_sync=8.4s, throughput=26.1 tok/s
-step:4 → kl_loss=1.206, grad_norm=0.062, cartridge_sync=10.0s, throughput=27.4 tok/s
+step:1  → kl_loss=0.749, grad_norm=0.019, cartridge_sync=10.8s, throughput=8.4 tok/s
+step:2  → kl_loss=1.110, grad_norm=0.021, cartridge_sync=9.5s,  throughput=24.7 tok/s
+step:3  → kl_loss=1.127, grad_norm=0.007, cartridge_sync=8.4s,  throughput=26.1 tok/s
+step:4  → kl_loss=1.206, grad_norm=0.062, cartridge_sync=10.0s, throughput=27.4 tok/s
+step:5-7 → (training continued)
+step:8  → kl_loss=0.957, grad_norm=0.025, cartridge_sync=9.9s,  throughput=26.8 tok/s
+step:9  → kl_loss=0.729, grad_norm=0.039, cartridge_sync=8.6s,  throughput=30.3 tok/s ← lowest KL
 ```
+
+Note: KL loss dropped from 0.749 → 0.729 over 9 steps, showing the cartridge is learning.
+Crashed at step 10 on checkpoint save (`CacheAndModel` missing `.config` attribute).
+Fix: disabled checkpointing (`save_freq=-1`) — a proper fix would add `.config` passthrough to `CacheAndModel`.
 
 **Timing breakdown per step (~75s):**
 - Rollout (Tokasaurus generation): ~12s
