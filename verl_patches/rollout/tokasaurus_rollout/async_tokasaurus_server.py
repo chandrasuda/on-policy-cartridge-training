@@ -287,15 +287,13 @@ class ServerAdapter:
         pass
 
     def __getattr__(self, name):
-        """Catch-all for any veRL lifecycle methods we haven't explicitly defined."""
-        def noop(*args, **kwargs):
-            pass
+        """Catch-all for any veRL lifecycle methods we haven't explicitly defined.
+        
+        veRL awaits most rollout methods, so default to async noop.
+        """
         async def async_noop(*args, **kwargs):
             pass
-        # Return async noop for methods that are likely awaited
-        if name in ("resume", "offload", "sleep", "wake_up", "clear_kv_cache"):
-            return async_noop
-        return noop
+        return async_noop
 
 
 # ---------------------------------------------------------------------------
