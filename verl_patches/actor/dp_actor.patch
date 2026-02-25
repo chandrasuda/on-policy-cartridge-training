@@ -1,5 +1,5 @@
 diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
-index c13ffa09..2b2a87d6 100644
+index c13ffa09..d964eec3 100644
 --- a/verl/workers/actor/dp_actor.py
 +++ b/verl/workers/actor/dp_actor.py
 @@ -146,6 +146,11 @@ class DataParallelPPOActor(BasePPOActor):
@@ -14,7 +14,7 @@ index c13ffa09..2b2a87d6 100644
          multi_modal_inputs = {}
          if "multi_modal_inputs" in micro_batch.keys():
              from verl.utils.model import extract_multi_modal_inputs
-@@ -421,6 +426,77 @@ class DataParallelPPOActor(BasePPOActor):
+@@ -421,6 +426,81 @@ class DataParallelPPOActor(BasePPOActor):
  
          return grad_norm
  
@@ -34,23 +34,27 @@ index c13ffa09..2b2a87d6 100644
 +            attention_mask = micro_batch["attention_mask"]
 +            position_ids = micro_batch["position_ids"]
 +
-+            # CacheAndModel expects unbatched (1, seqlen) inputs.
++            # CacheAndModel / FlexLlamaForCausalLM expects 1D tensors (no batch dim).
++            # FlexLlama internally does unsqueeze(0) to add the batch dimension.
 +            # Process each sample in the micro-batch independently.
 +            all_log_probs = []
 +            for i in range(batch_size):
 +                mask_i = attention_mask[i]  # (seqlen,)
-+                valid_len = mask_i.sum().item()
-+                ids_i = input_ids[i, :valid_len].unsqueeze(0)  # (1, valid_len)
++                valid_len = int(mask_i.sum().item())
++                ids_i = input_ids[i, :valid_len]  # (valid_len,) — 1D, no batch dim
 +
 +                # seq_ids: every token belongs to sequence 0
 +                seq_ids_i = torch.zeros(valid_len, dtype=torch.long, device=ids_i.device)
-+                pos_ids_i = position_ids[i, :valid_len].unsqueeze(0)  # (1, valid_len)
++                pos_ids_i = torch.arange(valid_len, dtype=torch.long, device=ids_i.device)  # 1D
 +
 +                # Clear cache state from previous sample
++                cache_obj = None
 +                if hasattr(self.actor_module, "cache"):
-+                    self.actor_module.cache.clear()
++                    cache_obj = self.actor_module.cache
 +                elif hasattr(self.actor_module, "module") and hasattr(self.actor_module.module, "cache"):
-+                    self.actor_module.module.cache.clear()
++                    cache_obj = self.actor_module.module.cache
++                if cache_obj is not None:
++                    cache_obj.clear()
 +
 +                output = self.actor_module(
 +                    input_ids=ids_i,
