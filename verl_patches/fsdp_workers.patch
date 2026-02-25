@@ -1,8 +1,8 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b57dbe01..75b7144f 100644
+index b57dbe01..8a3dc351 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
-@@ -523,6 +523,76 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -523,6 +523,89 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                  }
                  actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
  
@@ -57,6 +57,19 @@ index b57dbe01..75b7144f 100644
 +                        print(f"[cartridge] Downloaded from HF to {local_path}")
 +                else:
 +                    local_path = checkpoint_path
++                # Handle checkpoint key naming: some checkpoints use "fixed_keys"
++                # but TrainableCache.from_pretrained expects "frozen_keys"
++                import torch as _torch
++                _ckpt = _torch.load(local_path, map_location="cpu", weights_only=False)
++                if "fixed_keys" in _ckpt and "frozen_keys" not in _ckpt:
++                    _ckpt["frozen_keys"] = _ckpt.pop("fixed_keys")
++                    _ckpt["frozen_values"] = _ckpt.pop("fixed_values")
++                    _tmp_path = local_path + ".fixed"
++                    _torch.save(_ckpt, _tmp_path)
++                    local_path = _tmp_path
++                    if self.rank == 0:
++                        print("[cartridge] Renamed fixed_keys → frozen_keys in checkpoint")
++                del _ckpt
 +                cache = TrainableCache.from_pretrained(local_path)
 +            else:
 +                if self.rank == 0:
@@ -79,7 +92,7 @@ index b57dbe01..75b7144f 100644
          self.use_orig_params = fsdp_config.get("use_orig_params", False)
          if self.config.actor.get("freeze_vision_tower", False):
              vision_tower = get_vl_model_vision_tower(actor_module)
-@@ -637,7 +707,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -637,7 +720,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
          if role == "actor" and optim_config is not None:
              from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
  
@@ -95,7 +108,7 @@ index b57dbe01..75b7144f 100644
  
              total_steps = optim_config.get("total_training_steps", 0)
              num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
-@@ -913,6 +990,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -913,6 +1003,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
              self.actor = DataParallelPPOActor(
                  config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
              )
@@ -105,7 +118,7 @@ index b57dbe01..75b7144f 100644
  
          if self._is_rollout:
              self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
-@@ -981,6 +1061,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -981,6 +1074,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                  checkpoint_config=checkpoint_contents,
              )
  
