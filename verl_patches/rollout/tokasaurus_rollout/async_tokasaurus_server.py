@@ -69,14 +69,18 @@ class TokasaurusHttpServer:
     # ---- public API (called by AsyncLLMServerManager via .remote()) ----
 
     async def ping(self) -> bool:
-        """Health check."""
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-                async with s.get(f"{self.tokasaurus_url}/ping") as r:
-                    return r.status == 200
-        except Exception as e:
-            logger.warning(f"Tokasaurus ping failed: {e}")
-            return False
+        """Health check. Allows up to 5 min for cold-start (Modal scales to zero)."""
+        for attempt in range(5):
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
+                    async with s.get(f"{self.tokasaurus_url}/ping") as r:
+                        if r.status == 200:
+                            return True
+            except Exception as e:
+                logger.warning(f"Tokasaurus ping attempt {attempt+1}/5 failed: {e}")
+                if attempt < 4:
+                    await asyncio.sleep(15)
+        return False
 
     async def generate(
         self,
