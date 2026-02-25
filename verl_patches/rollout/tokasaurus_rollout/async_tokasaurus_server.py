@@ -248,6 +248,36 @@ _TokasaurusServerActor = ray.remote(TokasaurusHttpServer)
 
 
 # ---------------------------------------------------------------------------
+# ServerAdapter — required by veRL's hybrid engine _build_rollout()
+# ---------------------------------------------------------------------------
+
+class ServerAdapter:
+    """Minimal adapter for veRL's _ROLLOUT_REGISTRY.
+
+    In hybrid engine mode, veRL calls ``get_rollout_class(name, mode)`` which
+    expects a class with ``__init__(config, model_config, device_mesh)``.
+    Tokasaurus runs externally so this adapter is mostly a no-op — the real
+    work happens in TokasaurusReplica / TokasaurusHttpServer.
+    """
+
+    def __init__(self, config=None, model_config=None, device_mesh=None):
+        self.config = config
+        self.model_config = model_config
+
+    def generate_sequences(self, *args, **kwargs):
+        raise NotImplementedError("Tokasaurus uses external HTTP server, not in-process rollout")
+
+    def init_weight_from_actor(self, *args, **kwargs):
+        pass  # external server — no weight sync needed
+
+    def update_weight_from_actor(self, *args, **kwargs):
+        pass  # external server
+
+    def resume_from_checkpoint(self, *args, **kwargs):
+        pass
+
+
+# ---------------------------------------------------------------------------
 # TokasaurusReplica — veRL RolloutReplica for external Tokasaurus
 # ---------------------------------------------------------------------------
 

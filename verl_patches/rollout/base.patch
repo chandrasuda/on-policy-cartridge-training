@@ -1,0 +1,12 @@
+diff --git a/verl/workers/rollout/base.py b/verl/workers/rollout/base.py
+index 31d5b973..92f44508 100644
+--- a/verl/workers/rollout/base.py
++++ b/verl/workers/rollout/base.py
+@@ -82,6 +82,7 @@ _ROLLOUT_REGISTRY = {
+     ("vllm", "async"): "verl.workers.rollout.vllm_rollout.ServerAdapter",
+     ("sglang", "async"): "verl.workers.rollout.sglang_rollout.sglang_rollout.ServerAdapter",
+     ("trtllm", "async"): "verl.workers.rollout.trtllm_rollout.trtllm_rollout.ServerAdapter",
++    ("tokasaurus", "async"): "verl.workers.rollout.tokasaurus_rollout.async_tokasaurus_server.ServerAdapter",
+ }
+ 
+ 
