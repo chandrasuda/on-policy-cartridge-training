@@ -66,6 +66,8 @@ def load_longhealth():
                 "data_source": "longhealth",
                 "patient_id": patient_id,
                 "correct_answer": q["correct"],
+                # veRL's reward loop expects this field
+                "reward_model": {"ground_truth": q["correct"], "style": "rule"},
             })
 
     return prompts
