@@ -1,5 +1,5 @@
 diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
-index c13ffa09..d964eec3 100644
+index c13ffa09..8d1c30e1 100644
 --- a/verl/workers/actor/dp_actor.py
 +++ b/verl/workers/actor/dp_actor.py
 @@ -146,6 +146,11 @@ class DataParallelPPOActor(BasePPOActor):
@@ -14,7 +14,7 @@ index c13ffa09..d964eec3 100644
          multi_modal_inputs = {}
          if "multi_modal_inputs" in micro_batch.keys():
              from verl.utils.model import extract_multi_modal_inputs
-@@ -421,6 +426,81 @@ class DataParallelPPOActor(BasePPOActor):
+@@ -421,6 +426,84 @@ class DataParallelPPOActor(BasePPOActor):
  
          return grad_norm
  
@@ -91,7 +91,10 @@ index c13ffa09..d964eec3 100644
 +
 +            log_probs = torch.stack(all_log_probs, dim=0)  # (bs, response_length)
 +
-+        return {"log_probs": log_probs}
++        result = {"log_probs": log_probs}
++        # veRL expects entropy when calculate_entropy=True
++        result["entropys"] = torch.zeros_like(log_probs)
++        return result
 +
      @GPUMemoryLogger(role="dp actor", logger=logger)
      def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
