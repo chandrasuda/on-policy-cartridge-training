@@ -1,5 +1,5 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b57dbe01..b4a3ca5b 100644
+index b57dbe01..cc9a49f6 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -523,6 +523,59 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -88,3 +88,17 @@ index b57dbe01..b4a3ca5b 100644
  
          if self._is_rollout:
              self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+@@ -981,6 +1044,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 checkpoint_config=checkpoint_contents,
+             )
+ 
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    def save_cartridge(self, path: str):
++        """Save the updated TrainableCache to disk (for Tokasaurus sync)."""
++        if self._cartridge_cache is not None and self.rank == 0:
++            self._cartridge_cache.save(path)
++            print(f"[cartridge] Saved cache to {path}")
++
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+     @DistProfiler.annotate(color="red", role="actor_update")
+     def update_actor(self, data: DataProto):

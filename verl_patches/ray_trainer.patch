@@ -1,0 +1,59 @@
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 3b10492e..7f041d9d 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -280,6 +280,11 @@ class RayPPOTrainer:
+         self.use_rm = need_reward_model(self.config)
+ 
+         self.use_critic = need_critic(self.config)
++
++        # Cartridge sync: enabled when actor.cartridge.enabled is True
++        actor_cfg = config.actor_rollout_ref.get("actor", {})
++        cartridge_cfg = actor_cfg.get("cartridge", {}) if hasattr(actor_cfg, "get") else {}
++        self._cartridge_sync_enabled = cartridge_cfg.get("enabled", False) if hasattr(cartridge_cfg, "get") else False
+         self.ray_worker_group_cls = ray_worker_group_cls
+         self.device_name = device_name if device_name else self.config.trainer.device
+         self.validation_generations_logger = ValidationGenerationsLogger(
+@@ -1148,6 +1153,30 @@ class RayPPOTrainer:
+             old_log_prob_mfu = 0
+         return old_log_prob, old_log_prob_mfu
+ 
++    def _sync_cartridge_to_tokasaurus(self):
++        """Save updated cartridge and tell Tokasaurus to reload it.
++
++        Called after each actor update when cartridge training is enabled.
++        Uses the sync_cartridge mechanism on the rollout replica.
++        """
++        import tempfile, os
++
++        cartridge_path = os.path.join(tempfile.gettempdir(), "verl_cartridge_latest.pt")
++
++        # Ask the actor worker to save the cartridge
++        # The actor worker has access to self._cartridge_cache
++        self.actor_rollout_wg.save_cartridge(cartridge_path)
++
++        # Tell Tokasaurus rollout replicas to reload
++        # This triggers force_redownload=True on the next request
++        if hasattr(self, "rollout_replicas"):
++            import asyncio
++            for replica in self.rollout_replicas:
++                asyncio.get_event_loop().run_until_complete(
++                    replica.sync_cartridge(cartridge_path)
++                )
++            print(f"[cartridge] Synced updated cartridge to Tokasaurus: {cartridge_path}")
++
+     def _update_actor(self, batch: DataProto) -> DataProto:
+         rollout_config = self.config.actor_rollout_ref.rollout
+         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+@@ -1520,6 +1549,11 @@ class RayPPOTrainer:
+                         with marked_timer("update_weights", timing_raw, color="red"):
+                             self.checkpoint_manager.update_weights()
+ 
++                        # --- Cartridge sync: save updated cache → Tokasaurus reloads ---
++                        if getattr(self, "_cartridge_sync_enabled", False):
++                            with marked_timer("cartridge_sync", timing_raw, color="yellow"):
++                                self._sync_cartridge_to_tokasaurus()
++
+                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                         metrics.update(actor_output_metrics)
+ 
