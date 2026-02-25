@@ -1,8 +1,45 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b57dbe01..8a3dc351 100644
+index b57dbe01..42055159 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
-@@ -523,6 +523,89 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -456,13 +456,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 else:
+                     actor_module_class = AutoModel
+ 
+-            actor_module = actor_module_class.from_pretrained(
+-                pretrained_model_name_or_path=local_path,
+-                torch_dtype=torch_dtype,
+-                config=actor_model_config,
+-                trust_remote_code=trust_remote_code,
+-                attn_implementation=attn_implementation,
+-            )
++            # Cartridge mode: use FlexLlamaForCausalLM instead of standard Llama
++            _cart_cfg = self.config.actor.get("cartridge", {})
++            _cart_enabled = _cart_cfg.get("enabled", False) if isinstance(_cart_cfg, dict) else getattr(_cart_cfg, "enabled", False)
++            if _cart_enabled and role == "actor":
++                from cartridges.models.llama.modeling_llama import FlexLlamaForCausalLM
++                actor_module_class = FlexLlamaForCausalLM
++                if self.rank == 0:
++                    print("[cartridge] Using FlexLlamaForCausalLM (supports TrainableCache)")
++                # FlexLlama doesn't use attn_implementation kwarg
++                actor_module = actor_module_class.from_pretrained(
++                    pretrained_model_name_or_path=local_path,
++                    torch_dtype=torch_dtype,
++                    config=actor_model_config,
++                    trust_remote_code=trust_remote_code,
++                )
++            else:
++                actor_module = actor_module_class.from_pretrained(
++                    pretrained_model_name_or_path=local_path,
++                    torch_dtype=torch_dtype,
++                    config=actor_model_config,
++                    trust_remote_code=trust_remote_code,
++                    attn_implementation=attn_implementation,
++                )
+ 
+             # Apply Liger kernel to the model if use_liger is set to True
+             if use_liger:
+@@ -523,6 +539,89 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                  }
                  actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
  
@@ -92,7 +129,7 @@ index b57dbe01..8a3dc351 100644
          self.use_orig_params = fsdp_config.get("use_orig_params", False)
          if self.config.actor.get("freeze_vision_tower", False):
              vision_tower = get_vl_model_vision_tower(actor_module)
-@@ -637,7 +720,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -637,7 +736,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
          if role == "actor" and optim_config is not None:
              from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
  
@@ -108,7 +145,7 @@ index b57dbe01..8a3dc351 100644
  
              total_steps = optim_config.get("total_training_steps", 0)
              num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
-@@ -913,6 +1003,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -913,6 +1019,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
              self.actor = DataParallelPPOActor(
                  config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
              )
@@ -118,7 +155,7 @@ index b57dbe01..8a3dc351 100644
  
          if self._is_rollout:
              self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
-@@ -981,6 +1074,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -981,6 +1090,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                  checkpoint_config=checkpoint_contents,
              )
  
