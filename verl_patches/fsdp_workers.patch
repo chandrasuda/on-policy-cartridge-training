@@ -1,0 +1,90 @@
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index b57dbe01..b4a3ca5b 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -523,6 +523,59 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 }
+                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+ 
++        # --- Cartridge mode: freeze base model, load TrainableCache, wrap ---
++        cartridge_config = self.config.actor.get("cartridge", {})
++        self._cartridge_enabled = cartridge_config.get("enabled", False) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "enabled", False)
++        self._cartridge_cache = None
++
++        if self._cartridge_enabled and role == "actor":
++            from cartridges.cache import TrainableCache, AttnConfig
++            from cartridges.train import CacheAndModel
++            from cartridges.initialization import KVFromText
++
++            if self.rank == 0:
++                print("[cartridge] Freezing all base model parameters")
++            for param in actor_module.parameters():
++                param.requires_grad = False
++
++            # Build AttnConfig from the model
++            attn_config = AttnConfig(
++                n_layers=actor_model_config.num_hidden_layers,
++                n_heads=actor_model_config.num_key_value_heads,
++                head_dim=(
++                    actor_model_config.head_dim
++                    if hasattr(actor_model_config, "head_dim")
++                    else actor_model_config.hidden_size // actor_model_config.num_attention_heads
++                ),
++            )
++
++            # Initialize the cache
++            num_tokens = cartridge_config.get("num_tokens", 2048) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "num_tokens", 2048)
++            num_frozen = cartridge_config.get("num_frozen_tokens", 1) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "num_frozen_tokens", 1)
++            checkpoint_path = cartridge_config.get("checkpoint_path", None) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "checkpoint_path", None)
++
++            if checkpoint_path:
++                if self.rank == 0:
++                    print(f"[cartridge] Loading pre-trained cache from {checkpoint_path}")
++                cache = TrainableCache.from_pretrained(checkpoint_path, attn_config=attn_config)
++            else:
++                if self.rank == 0:
++                    print(f"[cartridge] Initializing cache with {num_tokens} tokens via KVFromText")
++                initializer = KVFromText(max_tokens=num_tokens, num_frozen_tokens=num_frozen)
++                cache = initializer.initialize_kv_cache(
++                    tokenizer=self.tokenizer, model=actor_module, attn_config=attn_config,
++                )
++
++            cache = cache.to(get_device_id())
++            self._cartridge_cache = cache
++
++            # Wrap: CacheAndModel passes past_key_values=cache to FlexLlamaForCausalLM
++            actor_module = CacheAndModel(cache, actor_module)
++            if self.rank == 0:
++                trainable_params = sum(p.numel() for p in cache.parameters() if p.requires_grad)
++                total_params = sum(p.numel() for p in actor_module.parameters())
++                print(f"[cartridge] Trainable params: {trainable_params:,} / {total_params:,} total")
++
+         self.use_orig_params = fsdp_config.get("use_orig_params", False)
+         if self.config.actor.get("freeze_vision_tower", False):
+             vision_tower = get_vl_model_vision_tower(actor_module)
+@@ -637,7 +690,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         if role == "actor" and optim_config is not None:
+             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+ 
+-            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
++            if self._cartridge_enabled and self._cartridge_cache is not None:
++                # Cartridge mode: only optimize cache parameters (base model is frozen)
++                cartridge_lr = cartridge_config.get("lr", 2e-2) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "lr", 2e-2)
++                actor_optimizer = torch.optim.Adam(self._cartridge_cache.parameters(), lr=cartridge_lr)
++                if self.rank == 0:
++                    print(f"[cartridge] Optimizer: Adam(cache.parameters(), lr={cartridge_lr})")
++            else:
++                actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+ 
+             total_steps = optim_config.get("total_training_steps", 0)
+             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+@@ -913,6 +973,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             self.actor = DataParallelPPOActor(
+                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+             )
++            # Propagate cartridge flag so dp_actor uses the cartridge forward path
++            self.actor._cartridge_enabled = getattr(self, "_cartridge_enabled", False)
++            self.actor._cartridge_cache = getattr(self, "_cartridge_cache", None)
+ 
+         if self._is_rollout:
+             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))

@@ -1,0 +1,94 @@
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index c13ffa09..2b2a87d6 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -146,6 +146,11 @@ class DataParallelPPOActor(BasePPOActor):
+                 )
+ 
+         response_length = micro_batch["responses"].size(-1)
++
++        # --- Cartridge mode: FlexLlamaForCausalLM takes (input_ids, seq_ids, position_ids) ---
++        if getattr(self, "_cartridge_enabled", False):
++            return self._forward_micro_batch_cartridge(micro_batch, temperature, response_length)
++
+         multi_modal_inputs = {}
+         if "multi_modal_inputs" in micro_batch.keys():
+             from verl.utils.model import extract_multi_modal_inputs
+@@ -421,6 +426,77 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+         return grad_norm
+ 
++    def _forward_micro_batch_cartridge(
++        self, micro_batch: dict[str, torch.Tensor], temperature: float, response_length: int
++    ) -> dict[str, torch.Tensor]:
++        """Cartridge-specific forward pass.
++
++        FlexLlamaForCausalLM / CacheAndModel takes (input_ids, seq_ids, position_ids)
++        instead of (input_ids, attention_mask, position_ids).  We convert the
++        attention_mask to seq_ids (all tokens belong to sequence 0) and call the
++        wrapped model directly.
++        """
++        with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
++            input_ids = micro_batch["input_ids"]  # (bs, seqlen)
++            batch_size, seqlen = input_ids.shape
++            attention_mask = micro_batch["attention_mask"]
++            position_ids = micro_batch["position_ids"]
++
++            # CacheAndModel expects unbatched (1, seqlen) inputs.
++            # Process each sample in the micro-batch independently.
++            all_log_probs = []
++            for i in range(batch_size):
++                mask_i = attention_mask[i]  # (seqlen,)
++                valid_len = mask_i.sum().item()
++                ids_i = input_ids[i, :valid_len].unsqueeze(0)  # (1, valid_len)
++
++                # seq_ids: every token belongs to sequence 0
++                seq_ids_i = torch.zeros(valid_len, dtype=torch.long, device=ids_i.device)
++                pos_ids_i = position_ids[i, :valid_len].unsqueeze(0)  # (1, valid_len)
++
++                # Clear cache state from previous sample
++                if hasattr(self.actor_module, "cache"):
++                    self.actor_module.cache.clear()
++                elif hasattr(self.actor_module, "module") and hasattr(self.actor_module.module, "cache"):
++                    self.actor_module.module.cache.clear()
++
++                output = self.actor_module(
++                    input_ids=ids_i,
++                    seq_ids=seq_ids_i,
++                    position_ids=pos_ids_i,
++                )
++
++                logits = output.logits.squeeze(0)  # (valid_len, vocab_size)
++                logits = logits / temperature
++
++                # Shift: predict next token
++                shifted_ids = input_ids[i, 1:valid_len]
++                shifted_logits = logits[:-1]  # (valid_len-1, vocab_size)
++
++                log_probs_i = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
++
++                # Pad back to response_length
++                # log_probs_i covers prompt+response-1 tokens, we want only the response part
++                prompt_len = seqlen - response_length
++                # Extract response logprobs (skip prompt tokens in the shifted sequence)
++                resp_log_probs = log_probs_i[max(0, prompt_len - 1):]
++                # Pad to response_length
++                if resp_log_probs.shape[0] < response_length:
++                    pad = torch.zeros(
++                        response_length - resp_log_probs.shape[0],
++                        device=resp_log_probs.device,
++                        dtype=resp_log_probs.dtype,
++                    )
++                    resp_log_probs = torch.cat([resp_log_probs, pad])
++                else:
++                    resp_log_probs = resp_log_probs[:response_length]
++
++                all_log_probs.append(resp_log_probs)
++
++            log_probs = torch.stack(all_log_probs, dim=0)  # (bs, response_length)
++
++        return {"log_probs": log_probs}
++
+     @GPUMemoryLogger(role="dp actor", logger=logger)
+     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
+         """Compute the log probability of the responses given input_ids, attention_mask and position_ids

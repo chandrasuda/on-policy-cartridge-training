@@ -1,0 +1,44 @@
+diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
+index 255acc7b..fbf2d4cd 100644
+--- a/verl/workers/config/actor.py
++++ b/verl/workers/config/actor.py
+@@ -26,7 +26,31 @@ from .engine import FSDPEngineConfig, McoreEngineConfig, VeOmniEngineConfig
+ from .model import HFModelConfig
+ from .optimizer import OptimizerConfig
+ 
++
++@dataclass
++class CartridgeConfig(BaseConfig):
++    """Configuration for Cartridge KV cache training.
++
++    When enabled, the actor freezes all base model parameters and only
++    trains the TrainableCache (KV tensor) parameters.  This is used for
++    on-policy Cartridge distillation via Tokasaurus.
++
++    Args:
++        enabled: Whether to use Cartridge training mode.
++        checkpoint_path: HuggingFace repo or local path to a pre-trained cartridge.
++        num_tokens: Number of KV cache tokens in the cartridge (default 2048).
++        num_frozen_tokens: Number of leading tokens to freeze (default 1).
++        lr: Learning rate for the cache optimizer (overrides actor.optim.lr).
++    """
++
++    enabled: bool = False
++    checkpoint_path: Optional[str] = None
++    num_tokens: int = 2048
++    num_frozen_tokens: int = 1
++    lr: float = 2e-2
++
+ __all__ = [
++    "CartridgeConfig",
+     "PolicyLossConfig",
+     "RouterReplayConfig",
+     "ActorConfig",
+@@ -173,6 +197,7 @@ class ActorConfig(BaseConfig):
+     rollout_n: int = MISSING  # must be override by sampling config
+     model_config: HFModelConfig = field(default_factory=BaseConfig)
+     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
++    cartridge: CartridgeConfig = field(default_factory=CartridgeConfig)
+ 
+     # Store global batch info for loss aggregation:
+     # dp_size: data parallel size
