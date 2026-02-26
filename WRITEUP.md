@@ -308,6 +308,8 @@ Compare to offline:
 
 6. **Checkpoint saving.** `CacheAndModel` wrapper lacks a `.config` attribute that veRL's checkpoint manager expects. Disabled via `save_freq=-1`. A proper fix: add `@property config` passthrough to `CacheAndModel`.
 
+7. **~~39% of steps had kl_loss=0.0~~** ROOT CAUSE FOUND AND FIXED (Issue #33). The `_forward_micro_batch_cartridge` method used `input_ids[i, :valid_len]` to extract tokens. With LEFT-padded inputs like `[0, 0, PAD, tok1, tok2, ...]`, this grabbed the padding zeros from the left instead of the actual tokens. The model received garbage input → garbage logprobs → KL matched the ref (both garbage) → KL=0. Fix: `input_ids[i][attention_mask[i].bool()]` extracts only the valid tokens regardless of padding direction.
+
 ### Next steps
 
 1. **Teacher with full documents (local):** Modify the ref worker's `compute_log_prob` to prepend document tokens when in cartridge mode. This keeps everything on the training GPU without HTTP calls. Requires veRL core changes to pass document text through the pipeline.
