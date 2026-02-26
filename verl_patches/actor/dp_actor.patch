@@ -1,5 +1,5 @@
 diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
-index c13ffa09..8d1c30e1 100644
+index c13ffa09..c32dda2b 100644
 --- a/verl/workers/actor/dp_actor.py
 +++ b/verl/workers/actor/dp_actor.py
 @@ -146,6 +146,11 @@ class DataParallelPPOActor(BasePPOActor):
@@ -14,7 +14,7 @@ index c13ffa09..8d1c30e1 100644
          multi_modal_inputs = {}
          if "multi_modal_inputs" in micro_batch.keys():
              from verl.utils.model import extract_multi_modal_inputs
-@@ -421,6 +426,84 @@ class DataParallelPPOActor(BasePPOActor):
+@@ -421,6 +426,91 @@ class DataParallelPPOActor(BasePPOActor):
  
          return grad_norm
  
@@ -39,9 +39,12 @@ index c13ffa09..8d1c30e1 100644
 +            # Process each sample in the micro-batch independently.
 +            all_log_probs = []
 +            for i in range(batch_size):
-+                mask_i = attention_mask[i]  # (seqlen,)
-+                valid_len = int(mask_i.sum().item())
-+                ids_i = input_ids[i, :valid_len]  # (valid_len,) — 1D, no batch dim
++                mask_i = attention_mask[i].bool()  # (seqlen,)
++                # CRITICAL: use boolean mask, NOT [:valid_len].
++                # input_ids is LEFT-padded: [0,0,PAD,tok1,tok2,...,resp1,resp2,PAD,0]
++                # [:valid_len] would grab the padding zeros from the left!
++                ids_i = input_ids[i][mask_i]  # (valid_len,) — only actual tokens
++                valid_len = ids_i.shape[0]
 +
 +                # seq_ids: every token belongs to sequence 0
 +                seq_ids_i = torch.zeros(valid_len, dtype=torch.long, device=ids_i.device)
@@ -66,16 +69,20 @@ index c13ffa09..8d1c30e1 100644
 +                logits = logits / temperature
 +
 +                # Shift: predict next token
-+                shifted_ids = input_ids[i, 1:valid_len]
-+                shifted_logits = logits[:-1]  # (valid_len-1, vocab_size)
++                # ids_i is already the valid tokens (no padding)
++                shifted_ids = ids_i[1:]  # next token ids
++                shifted_logits = logits[:-1]  # logits predicting each next token
 +
 +                log_probs_i = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
 +
-+                # Pad back to response_length
-+                # log_probs_i covers prompt+response-1 tokens, we want only the response part
-+                prompt_len = seqlen - response_length
-+                # Extract response logprobs (skip prompt tokens in the shifted sequence)
-+                resp_log_probs = log_probs_i[max(0, prompt_len - 1):]
++                # Extract only the response logprobs
++                # ids_i = [prompt_tokens..., response_tokens...]
++                # log_probs_i has valid_len-1 entries (shifted)
++                # response starts at position (valid_len - response_length) in ids_i
++                # In log_probs_i (shifted), response logprobs start at (valid_len - response_length - 1)
++                prompt_token_count = valid_len - response_length
++                resp_start = max(0, prompt_token_count - 1)
++                resp_log_probs = log_probs_i[resp_start:]
 +                # Pad to response_length
 +                if resp_log_probs.shape[0] < response_length:
 +                    pad = torch.zeros(
