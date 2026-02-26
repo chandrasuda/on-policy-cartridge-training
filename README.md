@@ -172,6 +172,10 @@ step:4 → kl_loss=1.081, grad_norm=0.030, cartridge_sync=6.9s
 | 26 | Missing `entropys` key in output | Cartridge forward only returned `log_probs` | Added `entropys=torch.zeros_like(log_probs)` |
 | 27 | A100-40GB OOM during backward | FlexAttention backward + 2048 cartridge tokens | Use A100-80GB + `micro_batch_size=1` |
 | 28 | `prompt_ids` tensor cat size mismatch | Chat template makes some prompts > `max_prompt_length` | Truncate prompts to `max_prompt_length` in agent loop postprocess |
+| 29 | `CacheAndModel` missing `.config` → checkpoint crash | veRL's checkpoint manager accesses `model.config` | Disabled checkpointing (`save_freq=-1`) |
+| 30 | Teacher logprobs all zeros (`kl_loss=0.0`) | `document_text`/`patient_id` stripped from `non_tensor_batch` by veRL pipeline | Reverted to ref model (no documents). Tokasaurus API can't return prompt logprobs. |
+| 31 | Patches repo was private → image build 404 | `gh repo create` defaulted to private | `gh repo edit --visibility public` |
+| 32 | Git clone fails in Modal containers at runtime | Modal restricts outbound git:// | Download ZIP via `urllib` during image build instead |
 
 ## See also
 

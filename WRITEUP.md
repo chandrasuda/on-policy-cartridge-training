@@ -281,25 +281,42 @@ Compare to offline:
 
 ### Current limitations
 
-1. **~~Teacher doesn't have full document context.~~** FIXED. The teacher now calls Tokasaurus directly with `[document_tokens + prompt + response]` and no cartridge (`_compute_teacher_logprobs_via_tokasaurus` in `ray_trainer.py`). Each sample's `document_text` is tokenized and prepended to the full input, then sent to Tokasaurus for teacher logprobs. This completely bypasses veRL's ref model — the teacher runs on the inference server with full 12K-token patient documents in context, matching the original paper's setup.
+1. **Teacher document context — investigated extensively, not yet solved.**
 
-2. **GRPO wrapper.** We're using veRL's GRPO algorithm as a wrapper with a dummy reward function. The actual training signal is the KL loss between actor and ref (`use_kl_loss=True`). A dedicated cartridge distillation trainer would be cleaner.
+   We made three attempts to give the teacher full patient documents:
 
-3. **No cartridge-specific evaluation.** We don't evaluate whether the cartridge improves on the LongHealth benchmark after training. Need to add generation eval (multiple choice accuracy).
+   **Attempt 1: Store `document_text` in training data.**
+   Added the 12K-char document text as a column in the parquet file (`prepare_data.py`). veRL's `RLHFDataset` loads it into `non_tensor_batch`. But veRL's data pipeline strips non-standard fields during rollout → batching → padding transformations. By the time `_compute_ref_log_prob` ran in `ray_trainer.py`, `non_tensor_batch` was empty. Result: all teacher logprobs were zero, `kl_loss=0.0` on every step.
 
-4. **Single-GPU training.** Currently runs on 1 GPU with FSDP NO_SHARD. Multi-GPU would require careful handling of `TrainableCache` (it's small enough to replicate, not shard).
+   **Attempt 2: Look up documents by `patient_id`.**
+   A shorter field (`"patient_01"`) that might survive the pipeline better. Downloaded LongHealth data at startup, built a `patient_id → documents` lookup. Result: `patient_id` was ALSO stripped from `non_tensor_batch`. Same zeros.
 
-5. **FlexAttention compilation overhead.** First forward pass triggers `torch.compile` for FlexAttention kernels (~14s). Subsequent passes are fast. Different sequence lengths trigger recompilation.
+   **Attempt 3: Match patient name from decoded prompt tokens.**
+   Since `input_ids` (the actual tokens) definitely survive the pipeline, we decoded the first 300 tokens and searched for patient names like "Anna Sample". Tested locally — 20/20 matches. But then discovered the fundamental blocker: **Tokasaurus's `packed_chosen_logprobs` only covers newly generated tokens, not prompt tokens.** Sending `[doc + prompt + response]` with `max_tokens=1` returns logprobs for just 1 new token. The student's response tokens are in the "prompt" part and don't get logprobs. `echo=True` returns HTTP 400 on the cartridge completions endpoint. **There is no Tokasaurus API to get teacher logprobs on arbitrary prompt tokens.**
+
+   **Current state:** Using veRL's ref model (same frozen Llama, no document context). KL loss = student (with cartridge) vs base model (without cartridge or documents). This is a weaker signal than the original paper's teacher (which sees full documents), but it's still valid — the cartridge should at minimum produce predictions that match the base model's.
+
+   **To properly fix:** Compute teacher logprobs locally on the training GPU by modifying the ref model's forward pass to prepend document tokens. This requires: (a) ensuring document text reaches the ref worker, (b) tokenizing documents, (c) extending `input_ids`, `attention_mask`, `position_ids` with document prefix, (d) running the ref forward pass on the longer sequence (~12K + 512 tokens), (e) extracting only the response token logprobs. This is feasible on an A100-80GB but requires significant changes to veRL's ref computation path.
+
+2. **GRPO wrapper.** We're using veRL's GRPO algorithm as a wrapper with a dummy reward function (`dummy_reward.py` returns 0.0). The actual training signal is the KL loss between actor and ref (`use_kl_loss=True`). A dedicated cartridge distillation trainer would be cleaner — just rollout → student fwd → teacher fwd → KL loss → backward, without the reward/advantage machinery.
+
+3. **No cartridge-specific evaluation.** We don't evaluate whether the cartridge improves on the LongHealth benchmark after training. Need to add generation eval (multiple choice accuracy). The `LongHealthMultipleChoiceGenerateDataset` class exists in the cartridges repo.
+
+4. **Single-GPU training.** Currently runs on 1 GPU with FSDP NO_SHARD. Multi-GPU would require careful handling of `TrainableCache` (it's tiny — 117M params — so blackbox, don't shard).
+
+5. **FlexAttention compilation overhead.** First forward pass triggers `torch.compile` for FlexAttention kernels (~14s). Different sequence lengths trigger recompilation. The `max-autotune-no-cudagraphs` mode in `FlexLlamaForCausalLM` helps.
+
+6. **Checkpoint saving.** `CacheAndModel` wrapper lacks a `.config` attribute that veRL's checkpoint manager expects. Disabled via `save_freq=-1`. A proper fix: add `@property config` passthrough to `CacheAndModel`.
 
 ### Next steps
 
-1. **Teacher with full documents:** Send student-generated text to Tokasaurus with documents in the prompt (no cartridge) → get teacher logprobs. The `get_teacher_logprobs()` method is already implemented in `async_tokasaurus_server.py`.
+1. **Teacher with full documents (local):** Modify the ref worker's `compute_log_prob` to prepend document tokens when in cartridge mode. This keeps everything on the training GPU without HTTP calls. Requires veRL core changes to pass document text through the pipeline.
 
-2. **Dedicated distillation trainer:** Replace GRPO with a simpler loop: rollout → student fwd → teacher fwd → KL loss → backward. No reward, no advantage estimation, no critic.
+2. **Dedicated distillation trainer:** Replace GRPO with a simpler training loop that doesn't need rewards, critics, or advantage estimation.
 
-3. **Evaluation:** After each epoch, generate answers to LongHealth multiple-choice questions and measure accuracy. Compare cartridge-conditioned vs baseline.
+3. **Evaluation:** Run LongHealth multiple-choice evaluation after training to measure cartridge quality improvement.
 
-4. **Offline + online hybrid:** Use the existing HuggingFace dataset (with pre-computed teacher logprobs) for the first epoch, then switch to on-policy for subsequent epochs.
+4. **Offline + online hybrid:** Use HuggingFace pre-computed data (`hazyresearch/m07d11_longhealth_synthesize_llama-3.2-3b_p10_n65536-*`) with teacher logprobs for warm-starting, then switch to on-policy.
 
 ---
 
@@ -317,9 +334,21 @@ step:8  → kl_loss=0.957, grad_norm=0.025, cartridge_sync=9.9s,  throughput=26.
 step:9  → kl_loss=0.729, grad_norm=0.039, cartridge_sync=8.6s,  throughput=30.3 tok/s ← lowest KL
 ```
 
-Note: KL loss dropped from 0.749 → 0.729 over 9 steps, showing the cartridge is learning.
-Crashed at step 10 on checkpoint save (`CacheAndModel` missing `.config` attribute).
-Fix: disabled checkpointing (`save_freq=-1`) — a proper fix would add `.config` passthrough to `CacheAndModel`.
+**Run 1 (ref model as teacher, no document context):**
+Previous run with veRL's ref model: KL loss ~0.7-1.2, completed 9/40 steps before checkpoint crash.
+
+**Run 2 (Tokasaurus as teacher with documents):**
+Attempted to call Tokasaurus with full documents — `kl_loss=0.0` on most steps because:
+(a) `document_text`/`patient_id` stripped from `non_tensor_batch` by veRL
+(b) Even with name-matching fix, Tokasaurus API can't return logprobs on prompt tokens
+
+**Run 3 (ref model, final working version):**
+```
+step:1  → kl_loss=0.010, grad_norm=0.0001
+step:2  → kl_loss=0.025, grad_norm=0.035
+step:3+ → training continues...
+```
+Stable training with consistent non-zero KL loss. ~90s/step, 40 steps total.
 
 **Timing breakdown per step (~75s):**
 - Rollout (Tokasaurus generation): ~12s
