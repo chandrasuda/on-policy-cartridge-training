@@ -1,5 +1,5 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b57dbe01..584a8958 100644
+index b57dbe01..71cb231a 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -456,13 +456,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -187,7 +187,7 @@ index b57dbe01..584a8958 100644
  
          micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
          data.meta_info["micro_batch_size"] = micro_batch_size
-@@ -1147,10 +1265,119 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -1147,11 +1265,155 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
          data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
          data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
          with self.ulysses_sharding_manager:
@@ -207,21 +207,40 @@ index b57dbe01..584a8958 100644
 +        """
 +        from verl.utils.torch_functional import logprobs_from_logits
 +
-+        # Load patient documents (cached)
++        # Load patient documents (cached). Try local file first, then HTTP.
 +        if not hasattr(self, "_patient_docs"):
-+            import requests as http_req
-+            print("[cartridge-ref] Loading LongHealth patient documents...")
-+            lh_data = http_req.get(
-+                "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
-+            ).json()
++            import json as _json
 +            self._patient_docs = {}
 +            self._patient_names = {}
-+            for pid, patient in lh_data.items():
-+                self._patient_docs[pid] = "\n\n".join(
-+                    f"--- {did} ---\n{txt}" for did, txt in patient["texts"].items()
-+                )
-+                self._patient_names[pid] = patient["name"]
-+            print(f"[cartridge-ref] Loaded {len(self._patient_docs)} patients")
++            # Try local file (saved by prepare_data.py or modal_train.py)
++            lh_path = "/tmp/longhealth_data.json"
++            try:
++                if os.path.exists(lh_path):
++                    with open(lh_path) as f:
++                        lh_data = _json.load(f)
++                    print(f"[cartridge-ref] Loaded LongHealth from {lh_path}")
++                else:
++                    import requests as http_req
++                    print("[cartridge-ref] Downloading LongHealth data...")
++                    lh_data = http_req.get(
++                        "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json",
++                        timeout=30,
++                    ).json()
++                    # Save for future use
++                    with open(lh_path, "w") as f:
++                        _json.dump(lh_data, f)
++                    print(f"[cartridge-ref] Downloaded and saved to {lh_path}")
++
++                for pid, patient in lh_data.items():
++                    self._patient_docs[pid] = "\n\n".join(
++                        f"--- {did} ---\n{txt}" for did, txt in patient["texts"].items()
++                    )
++                    self._patient_names[pid] = patient["name"]
++                print(f"[cartridge-ref] {len(self._patient_docs)} patients loaded")
++            except Exception as e:
++                print(f"[cartridge-ref] FAILED to load documents: {e}")
++                # Return empty — will use ref model without documents
++                return self._compute_ref_without_documents(data)
 +
 +        batch_size = data.batch["input_ids"].shape[0]
 +        response_length = data.batch["responses"].shape[-1]
@@ -305,6 +324,23 @@ index b57dbe01..584a8958 100644
 +
 +        output = DataProto.from_dict(tensors={"ref_log_prob": ref_log_prob})
 +
++        output = output.to("cpu")
++
++    def _compute_ref_without_documents(self, data):
++        """Fallback: compute ref logprobs without document context."""
++        print("[cartridge-ref] Falling back to ref model without documents")
++        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
++        data.meta_info["micro_batch_size"] = micro_batch_size
++        data.meta_info["temperature"] = self.config.rollout.temperature
++        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
++        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
++        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
++        with self.ulysses_sharding_manager:
++            data = data.to("cpu")
++            outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
++            output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
          output = output.to("cpu")
++        return output
  
          # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+         # unshard the root FSDP module
