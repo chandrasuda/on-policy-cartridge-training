@@ -1,5 +1,5 @@
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
-index 3b10492e..f2b99d3b 100644
+index 3b10492e..e4e2aefb 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
 @@ -280,6 +280,11 @@ class RayPPOTrainer:
@@ -14,12 +14,12 @@ index 3b10492e..f2b99d3b 100644
          self.ray_worker_group_cls = ray_worker_group_cls
          self.device_name = device_name if device_name else self.config.trainer.device
          self.validation_generations_logger = ValidationGenerationsLogger(
-@@ -1096,7 +1101,125 @@ class RayPPOTrainer:
+@@ -1096,7 +1101,123 @@ class RayPPOTrainer:
              values = self.critic_wg.compute_values(batch)
          return values
  
 +    def _get_patient_documents(self):
-+        """Load patient documents from LongHealth (cached after first call)."""
++        """Load patient documents + names from LongHealth (cached after first call)."""
 +        if not hasattr(self, "_patient_docs"):
 +            import requests as http_req
 +            print("[cartridge] Loading LongHealth patient documents for teacher...")
@@ -27,11 +27,13 @@ index 3b10492e..f2b99d3b 100644
 +                "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
 +            ).json()
 +            self._patient_docs = {}
++            self._patient_names = {}
 +            for pid, patient in data.items():
 +                self._patient_docs[pid] = "\n\n".join(
 +                    f"--- {doc_id} ---\n{text}" for doc_id, text in patient["texts"].items()
 +                )
-+            print(f"[cartridge] Loaded documents for {len(self._patient_docs)} patients")
++                self._patient_names[pid] = patient["name"]
++            print(f"[cartridge] Loaded documents for {len(self._patient_docs)} patients: {list(self._patient_names.values())}")
 +        return self._patient_docs
 +
 +    def _compute_teacher_logprobs_via_tokasaurus(self, batch: DataProto) -> DataProto:
@@ -60,19 +62,15 @@ index 3b10492e..f2b99d3b 100644
 +            response_mask = batch.batch["response_mask"][i]
 +            valid_response_len = int(response_mask.sum().item())
 +
-+            # Look up document text by patient_id (survives better than document_text)
++            # Look up documents by decoding prompt text and matching patient name.
++            # non_tensor_batch fields get dropped by veRL's pipeline, so we
++            # extract the patient identity from the actual prompt tokens.
 +            doc_text = ""
-+            if hasattr(batch, "non_tensor_batch") and batch.non_tensor_batch is not None:
-+                # Try patient_id first
-+                patient_ids = batch.non_tensor_batch.get("patient_id", None)
-+                if patient_ids is not None and i < len(patient_ids):
-+                    pid = patient_ids[i]
-+                    doc_text = patient_docs.get(pid, "")
-+                # Fall back to document_text if available
-+                if not doc_text:
-+                    doc_texts = batch.non_tensor_batch.get("document_text", None)
-+                    if doc_texts is not None and i < len(doc_texts):
-+                        doc_text = doc_texts[i]
++            prompt_text = self.tokenizer.decode(valid_ids[:300], skip_special_tokens=True)
++            for pid, pname in self._patient_names.items():
++                if pname and pname in prompt_text:
++                    doc_text = patient_docs[pid]
++                    break
 +
 +            if not doc_text:
 +                # No document context — use empty (teacher = base model with no context)
@@ -140,7 +138,7 @@ index 3b10492e..f2b99d3b 100644
          if self.use_legacy_worker_impl == "disable":
              # step 1: convert dataproto to tensordict.
              batch_td = batch.to_tensordict()
-@@ -1148,6 +1271,30 @@ class RayPPOTrainer:
+@@ -1148,6 +1269,30 @@ class RayPPOTrainer:
              old_log_prob_mfu = 0
          return old_log_prob, old_log_prob_mfu
  
@@ -171,7 +169,7 @@ index 3b10492e..f2b99d3b 100644
      def _update_actor(self, batch: DataProto) -> DataProto:
          rollout_config = self.config.actor_rollout_ref.rollout
          batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-@@ -1520,6 +1667,11 @@ class RayPPOTrainer:
+@@ -1520,6 +1665,11 @@ class RayPPOTrainer:
                          with marked_timer("update_weights", timing_raw, color="red"):
                              self.checkpoint_manager.update_weights()
  
