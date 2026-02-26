@@ -1,5 +1,5 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b57dbe01..42055159 100644
+index b57dbe01..584a8958 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -456,13 +456,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -169,3 +169,142 @@ index b57dbe01..42055159 100644
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
      @DistProfiler.annotate(color="red", role="actor_update")
      def update_actor(self, data: DataProto):
+@@ -1133,12 +1249,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+     def compute_ref_log_prob(self, data: DataProto):
+         if self._is_lora:
+-            # if _is_lora, actor without lora applied is the ref
+             data.meta_info["is_lora"] = True
+             return self.compute_log_prob(data)
++
++        # --- Cartridge mode: ref model with document context ---
++        if getattr(self, "_cartridge_enabled", False):
++            return self._compute_ref_with_documents(data)
++
+         assert self._is_ref
+-        # else:
+-        # otherwise, the class have a standalone ref model
+ 
+         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
+         data.meta_info["micro_batch_size"] = micro_batch_size
+@@ -1147,10 +1265,119 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+         with self.ulysses_sharding_manager:
+-            data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
++            data = data.to("cpu")
+             outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+             output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
+ 
++    def _compute_ref_with_documents(self, data: DataProto):
++        """Compute ref logprobs with full patient documents prepended.
++
++        For each sample:
++        1. Decode prompt tokens → match patient name → look up documents
++        2. Tokenize documents, prepend to input_ids
++        3. Forward pass through ref model (standard Llama with flash attention)
++        4. Extract logprobs for only the response tokens
++        """
++        from verl.utils.torch_functional import logprobs_from_logits
++
++        # Load patient documents (cached)
++        if not hasattr(self, "_patient_docs"):
++            import requests as http_req
++            print("[cartridge-ref] Loading LongHealth patient documents...")
++            lh_data = http_req.get(
++                "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
++            ).json()
++            self._patient_docs = {}
++            self._patient_names = {}
++            for pid, patient in lh_data.items():
++                self._patient_docs[pid] = "\n\n".join(
++                    f"--- {did} ---\n{txt}" for did, txt in patient["texts"].items()
++                )
++                self._patient_names[pid] = patient["name"]
++            print(f"[cartridge-ref] Loaded {len(self._patient_docs)} patients")
++
++        batch_size = data.batch["input_ids"].shape[0]
++        response_length = data.batch["responses"].shape[-1]
++        temperature = data.meta_info.get("temperature", 1.0)
++        device = get_device_id()
++
++        # Get ref model (unwrap FSDP if needed)
++        ref_model = self.ref_module_fsdp
++
++        if self._is_offload_param:
++            load_fsdp_model_to_gpu(ref_model)
++
++        all_ref_logprobs = []
++        teacher_hits = 0
++
++        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
++            for i in range(batch_size):
++                attention_mask = data.batch["attention_mask"][i]
++                input_ids = data.batch["input_ids"][i]
++                valid_ids = input_ids[attention_mask.bool()]
++                response_mask = data.batch["response_mask"][i]
++                valid_response_len = int(response_mask.sum().item())
++
++                # Find patient documents from prompt text
++                prompt_text = self.tokenizer.decode(valid_ids[:300].tolist(), skip_special_tokens=True)
++                doc_ids_list = []
++                for pid, pname in self._patient_names.items():
++                    if pname and pname in prompt_text:
++                        doc_text = self._patient_docs[pid]
++                        doc_ids_list = self.tokenizer.encode(doc_text, add_special_tokens=False)
++                        teacher_hits += 1
++                        break
++
++                # Build extended input: [doc_tokens + original_valid_tokens]
++                if doc_ids_list:
++                    doc_tensor = torch.tensor(doc_ids_list, dtype=torch.long, device=device)
++                    ext_ids = torch.cat([doc_tensor, valid_ids.to(device)]).unsqueeze(0)
++                else:
++                    ext_ids = valid_ids.to(device).unsqueeze(0)
++
++                ext_len = ext_ids.shape[1]
++                ext_mask = torch.ones(1, ext_len, dtype=torch.long, device=device)
++                ext_pos = torch.arange(ext_len, dtype=torch.long, device=device).unsqueeze(0)
++
++                # Forward pass through ref model
++                output = ref_model(
++                    input_ids=ext_ids,
++                    attention_mask=ext_mask,
++                    position_ids=ext_pos,
++                    use_cache=False,
++                )
++
++                logits = output.logits.squeeze(0) / temperature  # (ext_len, vocab)
++
++                # Extract response logprobs
++                # Response tokens are at the END of the extended sequence
++                # shifted by 1 for next-token prediction
++                doc_prompt_len = ext_len - valid_response_len
++                shifted_ids = ext_ids.squeeze(0)[doc_prompt_len:]  # response token ids
++                shifted_logits = logits[doc_prompt_len - 1:-1]  # logits predicting response tokens
++
++                if shifted_logits.shape[0] > 0 and shifted_ids.shape[0] > 0:
++                    resp_lp = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
++                else:
++                    resp_lp = torch.zeros(valid_response_len, device=device)
++
++                # Pad to response_length
++                if resp_lp.shape[0] < response_length:
++                    pad = torch.zeros(response_length - resp_lp.shape[0], device=device)
++                    resp_lp = torch.cat([resp_lp, pad])
++                else:
++                    resp_lp = resp_lp[:response_length]
++
++                all_ref_logprobs.append(resp_lp)
++
++        ref_log_prob = torch.stack(all_ref_logprobs, dim=0).float().cpu()
++        print(f"[cartridge-ref] Teacher: {teacher_hits}/{batch_size} with docs, mean_lp={ref_log_prob[ref_log_prob != 0].mean():.4f}")
++
++        if self._is_offload_param:
++            offload_fsdp_model_to_cpu(ref_model)
++
++        output = DataProto.from_dict(tensors={"ref_log_prob": ref_log_prob})
++
+         output = output.to("cpu")
+ 
+         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
