@@ -1,5 +1,5 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b57dbe01..71cb231a 100644
+index b57dbe01..7d5ab6da 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -456,13 +456,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -187,7 +187,7 @@ index b57dbe01..71cb231a 100644
  
          micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
          data.meta_info["micro_batch_size"] = micro_batch_size
-@@ -1147,11 +1265,155 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -1147,20 +1265,163 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
          data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
          data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
          with self.ulysses_sharding_manager:
@@ -195,6 +195,17 @@ index b57dbe01..71cb231a 100644
 +            data = data.to("cpu")
              outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
              output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
+ 
+         output = output.to("cpu")
+-
+-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+-        # unshard the root FSDP module
+         if self.world_size > 1:
+             if fsdp_version(self.ref_policy.actor_module) == 1:
+                 self.ref_policy.actor_module._handle.reshard(True)
+             elif fsdp_version(self.ref_policy.actor_module) == 2:
+                 self.ref_policy.actor_module.reshard()
++        return output
  
 +    def _compute_ref_with_documents(self, data: DataProto):
 +        """Compute ref logprobs with full patient documents prepended.
@@ -205,6 +216,7 @@ index b57dbe01..71cb231a 100644
 +        3. Forward pass through ref model (standard Llama with flash attention)
 +        4. Extract logprobs for only the response tokens
 +        """
++        import os
 +        from verl.utils.torch_functional import logprobs_from_logits
 +
 +        # Load patient documents (cached). Try local file first, then HTTP.
@@ -323,8 +335,8 @@ index b57dbe01..71cb231a 100644
 +            offload_fsdp_model_to_cpu(ref_model)
 +
 +        output = DataProto.from_dict(tensors={"ref_log_prob": ref_log_prob})
-+
 +        output = output.to("cpu")
++        return output
 +
 +    def _compute_ref_without_documents(self, data):
 +        """Fallback: compute ref logprobs without document context."""
@@ -339,8 +351,7 @@ index b57dbe01..71cb231a 100644
 +            data = data.to("cpu")
 +            outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
 +            output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
-         output = output.to("cpu")
-+        return output
++        output = output.to("cpu")
+         return output
  
-         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-         # unshard the root FSDP module
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
