@@ -344,13 +344,26 @@ Attempted to call Tokasaurus with full documents — `kl_loss=0.0` on most steps
 (a) `document_text`/`patient_id` stripped from `non_tensor_batch` by veRL
 (b) Even with name-matching fix, Tokasaurus API can't return logprobs on prompt tokens
 
-**Run 3 (ref model, final working version):**
+**Run 3 (ref model without documents):**
+KL loss ~0.01-0.03, intermittent zeros (39% of steps). Completed 40 steps.
+
+**Run 4 (FINAL — ref model with full patient documents, left-padding fix):**
 ```
-step:1  → kl_loss=0.010, grad_norm=0.0001
-step:2  → kl_loss=0.025, grad_norm=0.035
-step:3+ → training continues...
+step 1:  5.08  ← teacher with 12K-token documents produces very different logprobs
+step 2:  4.95
+step 3:  3.91  ← cartridge rapidly improving
+step 5:  3.91
+step 8:  3.52
+step 10: 2.76
+step 15: 2.56
+step 20: 2.67
+step 25: 2.31
+step 30: 2.15  ← lowest
+step 35: 2.91
+step 40: 2.45  ← final (51% reduction from start)
 ```
-Stable training with consistent non-zero KL loss. ~90s/step, 40 steps total.
+**KL decreased from 5.08 → 2.45 (51% reduction).** Teacher: 8/8 samples with documents on EVERY step.
+100% teacher hit rate, zero failed steps. Completed in 49 minutes on A100-80GB.
 
 **Timing breakdown per step (~75s):**
 - Rollout (Tokasaurus generation): ~12s
