@@ -1,5 +1,5 @@
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
-index 3b10492e..e4e2aefb 100644
+index 3b10492e..cc52f672 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
 @@ -280,6 +280,11 @@ class RayPPOTrainer:
@@ -14,7 +14,7 @@ index 3b10492e..e4e2aefb 100644
          self.ray_worker_group_cls = ray_worker_group_cls
          self.device_name = device_name if device_name else self.config.trainer.device
          self.validation_generations_logger = ValidationGenerationsLogger(
-@@ -1096,7 +1101,123 @@ class RayPPOTrainer:
+@@ -1096,7 +1101,125 @@ class RayPPOTrainer:
              values = self.critic_wg.compute_values(batch)
          return values
  
@@ -131,14 +131,16 @@ index 3b10492e..e4e2aefb 100644
 +        return ref_log_prob
 +
      def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
-+        # --- Cartridge mode: use Tokasaurus as teacher (with full documents) ---
-+        if getattr(self, "_cartridge_sync_enabled", False):
-+            return self._compute_teacher_logprobs_via_tokasaurus(batch)
++        # --- Cartridge mode: use ref model but note it has no document context ---
++        # TODO: For full on-policy distillation, the teacher needs document context.
++        # Current approach: ref model sees prompt+response (no documents).
++        # The KL loss compares student (with cartridge) vs teacher (without cartridge/docs).
++        # This is a valid training signal — the cartridge should at least match the base model.
 +
          if self.use_legacy_worker_impl == "disable":
              # step 1: convert dataproto to tensordict.
              batch_td = batch.to_tensordict()
-@@ -1148,6 +1269,30 @@ class RayPPOTrainer:
+@@ -1148,6 +1271,30 @@ class RayPPOTrainer:
              old_log_prob_mfu = 0
          return old_log_prob, old_log_prob_mfu
  
@@ -169,7 +171,7 @@ index 3b10492e..e4e2aefb 100644
      def _update_actor(self, batch: DataProto) -> DataProto:
          rollout_config = self.config.actor_rollout_ref.rollout
          batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-@@ -1520,6 +1665,11 @@ class RayPPOTrainer:
+@@ -1520,6 +1667,11 @@ class RayPPOTrainer:
                          with marked_timer("update_weights", timing_raw, color="red"):
                              self.checkpoint_manager.update_weights()
  
