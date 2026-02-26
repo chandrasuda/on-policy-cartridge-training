@@ -1,5 +1,5 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b57dbe01..7d5ab6da 100644
+index b57dbe01..76feb074 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -456,13 +456,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -169,7 +169,7 @@ index b57dbe01..7d5ab6da 100644
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
      @DistProfiler.annotate(color="red", role="actor_update")
      def update_actor(self, data: DataProto):
-@@ -1133,12 +1249,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -1133,12 +1249,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
      @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
      def compute_ref_log_prob(self, data: DataProto):
          if self._is_lora:
@@ -179,7 +179,14 @@ index b57dbe01..7d5ab6da 100644
 +
 +        # --- Cartridge mode: ref model with document context ---
 +        if getattr(self, "_cartridge_enabled", False):
-+            return self._compute_ref_with_documents(data)
++            try:
++                return self._compute_ref_with_documents(data)
++            except Exception as e:
++                print(f"[cartridge-ref] ERROR in _compute_ref_with_documents: {e}")
++                import traceback
++                traceback.print_exc()
++                # Fall back to standard ref model
++                return self._compute_ref_without_documents(data)
 +
          assert self._is_ref
 -        # else:
@@ -187,7 +194,7 @@ index b57dbe01..7d5ab6da 100644
  
          micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
          data.meta_info["micro_batch_size"] = micro_batch_size
-@@ -1147,20 +1265,163 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -1147,20 +1272,167 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
          data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
          data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
          with self.ulysses_sharding_manager:
@@ -279,12 +286,16 @@ index b57dbe01..7d5ab6da 100644
 +                # Find patient documents from prompt text
 +                prompt_text = self.tokenizer.decode(valid_ids[:300].tolist(), skip_special_tokens=True)
 +                doc_ids_list = []
++                matched_name = None
 +                for pid, pname in self._patient_names.items():
 +                    if pname and pname in prompt_text:
 +                        doc_text = self._patient_docs[pid]
 +                        doc_ids_list = self.tokenizer.encode(doc_text, add_special_tokens=False)
++                        matched_name = pname
 +                        teacher_hits += 1
 +                        break
++                if not matched_name and i == 0:
++                    print(f"[cartridge-ref] NO MATCH for sample 0. First 100 chars: {prompt_text[:100]}")
 +
 +                # Build extended input: [doc_tokens + original_valid_tokens]
 +                if doc_ids_list:
