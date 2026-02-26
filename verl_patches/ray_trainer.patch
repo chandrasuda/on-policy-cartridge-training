@@ -1,5 +1,5 @@
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
-index 3b10492e..8b16b117 100644
+index 3b10492e..f2b99d3b 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
 @@ -280,6 +280,11 @@ class RayPPOTrainer:
@@ -14,21 +14,31 @@ index 3b10492e..8b16b117 100644
          self.ray_worker_group_cls = ray_worker_group_cls
          self.device_name = device_name if device_name else self.config.trainer.device
          self.validation_generations_logger = ValidationGenerationsLogger(
-@@ -1096,7 +1101,105 @@ class RayPPOTrainer:
+@@ -1096,7 +1101,125 @@ class RayPPOTrainer:
              values = self.critic_wg.compute_values(batch)
          return values
  
++    def _get_patient_documents(self):
++        """Load patient documents from LongHealth (cached after first call)."""
++        if not hasattr(self, "_patient_docs"):
++            import requests as http_req
++            print("[cartridge] Loading LongHealth patient documents for teacher...")
++            data = http_req.get(
++                "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
++            ).json()
++            self._patient_docs = {}
++            for pid, patient in data.items():
++                self._patient_docs[pid] = "\n\n".join(
++                    f"--- {doc_id} ---\n{text}" for doc_id, text in patient["texts"].items()
++                )
++            print(f"[cartridge] Loaded documents for {len(self._patient_docs)} patients")
++        return self._patient_docs
++
 +    def _compute_teacher_logprobs_via_tokasaurus(self, batch: DataProto) -> DataProto:
 +        """Compute teacher logprobs via Tokasaurus with full document context.
 +
-+        Instead of using veRL's ref model (which only sees prompt+response),
-+        this sends each sample's response to Tokasaurus with the full patient
-+        documents prepended. The teacher sees:
-+            [document_tokens + prompt_tokens + response_tokens]
-+        and returns logprobs on the response tokens.
-+
-+        This is what makes the distillation truly faithful to the original
-+        Cartridges paper: the teacher has access to the full source documents.
++        Sends each sample to Tokasaurus with full patient documents prepended
++        (no cartridge). Looks up documents by patient_id from the batch.
 +        """
 +        import requests as http_requests
 +        import json
@@ -37,37 +47,43 @@ index 3b10492e..8b16b117 100644
 +        batch_size = batch.batch["input_ids"].shape[0]
 +        response_length = batch.batch["responses"].shape[-1]
 +        tokasaurus_url = self.config.actor_rollout_ref.rollout.custom.get("tokasaurus_url", "")
++        patient_docs = self._get_patient_documents()
 +
 +        all_ref_logprobs = []
++        teacher_hits = 0
 +        for i in range(batch_size):
-+            # Extract prompt and response token IDs (remove padding)
++            # Extract valid token IDs (remove padding)
 +            attention_mask = batch.batch["attention_mask"][i]
 +            input_ids = batch.batch["input_ids"][i]
-+            valid_mask = attention_mask.bool()
-+            valid_ids = input_ids[valid_mask].tolist()
++            valid_ids = input_ids[attention_mask.bool()].tolist()
 +
-+            # Split into prompt and response
-+            prompt_len = batch.batch["input_ids"].shape[-1] - response_length
-+            prompt_ids = input_ids[prompt_len - attention_mask[:prompt_len].sum():prompt_len][attention_mask[:prompt_len].bool()[-attention_mask[:prompt_len].sum().int():]].tolist() if attention_mask[:prompt_len].sum() > 0 else []
 +            response_mask = batch.batch["response_mask"][i]
-+            response_ids = batch.batch["responses"][i]
 +            valid_response_len = int(response_mask.sum().item())
-+            response_ids_list = response_ids[:valid_response_len].tolist()
 +
-+            # Get document text if available
++            # Look up document text by patient_id (survives better than document_text)
 +            doc_text = ""
 +            if hasattr(batch, "non_tensor_batch") and batch.non_tensor_batch is not None:
-+                doc_text = batch.non_tensor_batch.get("document_text", [""] * batch_size)[i]
++                # Try patient_id first
++                patient_ids = batch.non_tensor_batch.get("patient_id", None)
++                if patient_ids is not None and i < len(patient_ids):
++                    pid = patient_ids[i]
++                    doc_text = patient_docs.get(pid, "")
++                # Fall back to document_text if available
++                if not doc_text:
++                    doc_texts = batch.non_tensor_batch.get("document_text", None)
++                    if doc_texts is not None and i < len(doc_texts):
++                        doc_text = doc_texts[i]
++
++            if not doc_text:
++                # No document context — use empty (teacher = base model with no context)
++                all_ref_logprobs.append([0.0] * response_length)
++                continue
 +
 +            # Tokenize document
-+            if doc_text:
-+                doc_ids = self.tokenizer.encode(doc_text, add_special_tokens=False)
-+            else:
-+                doc_ids = []
++            doc_ids = self.tokenizer.encode(doc_text, add_special_tokens=False)
 +
-+            # Build full teacher prompt: [documents + prompt + response]
-+            # Send to Tokasaurus WITHOUT cartridge
-+            full_prompt = doc_ids + valid_ids  # doc + prompt + response tokens
++            # Full teacher prompt: [doc_tokens + prompt_tokens + response_tokens]
++            full_prompt = doc_ids + valid_ids
 +            payload = {
 +                "model": "default",
 +                "prompt": full_prompt,
@@ -89,22 +105,26 @@ index 3b10492e..8b16b117 100644
 +                    packed = fp.get("packed_chosen_logprobs")
 +                    if packed and packed[0]:
 +                        all_lp = np.frombuffer(base64.b64decode(packed[0]), dtype=np.float32)
-+                        # Extract logprobs for just the response tokens
-+                        # (skip document + prompt tokens in the shifted logprob sequence)
-+                        doc_prompt_len = len(doc_ids) + len(valid_ids) - valid_response_len
-+                        teacher_lp = all_lp[max(0, doc_prompt_len - 1):][:valid_response_len]
-+                        teacher_lp = teacher_lp.tolist()
++                        # Extract logprobs for the response tokens only
++                        # The logprobs cover the full prompt (shifted by 1 for next-token)
++                        # Skip doc + prompt tokens, keep only response tokens
++                        skip = len(full_prompt) - valid_response_len
++                        teacher_lp = all_lp[max(0, skip - 1):][:valid_response_len].tolist()
++                        teacher_hits += 1
 +                    else:
 +                        teacher_lp = [0.0] * valid_response_len
 +                else:
++                    print(f"[cartridge] Teacher HTTP {resp.status_code} for sample {i}")
 +                    teacher_lp = [0.0] * valid_response_len
 +            except Exception as e:
-+                print(f"[cartridge] Teacher logprob call failed for sample {i}: {e}")
++                print(f"[cartridge] Teacher call failed for sample {i}: {e}")
 +                teacher_lp = [0.0] * valid_response_len
 +
 +            # Pad to response_length
 +            padded = teacher_lp + [0.0] * (response_length - len(teacher_lp))
 +            all_ref_logprobs.append(padded[:response_length])
++
++        print(f"[cartridge] Teacher logprobs: {teacher_hits}/{batch_size} samples got document context")
 +
 +        ref_log_prob_tensor = torch.tensor(all_ref_logprobs, dtype=torch.float32)
 +        ref_log_prob = DataProto.from_tensordict(
@@ -120,7 +140,7 @@ index 3b10492e..8b16b117 100644
          if self.use_legacy_worker_impl == "disable":
              # step 1: convert dataproto to tensordict.
              batch_td = batch.to_tensordict()
-@@ -1148,6 +1251,30 @@ class RayPPOTrainer:
+@@ -1148,6 +1271,30 @@ class RayPPOTrainer:
              old_log_prob_mfu = 0
          return old_log_prob, old_log_prob_mfu
  
@@ -151,7 +171,7 @@ index 3b10492e..8b16b117 100644
      def _update_actor(self, batch: DataProto) -> DataProto:
          rollout_config = self.config.actor_rollout_ref.rollout
          batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-@@ -1520,6 +1647,11 @@ class RayPPOTrainer:
+@@ -1520,6 +1667,11 @@ class RayPPOTrainer:
                          with marked_timer("update_weights", timing_raw, color="red"):
                              self.checkpoint_manager.update_weights()
  
